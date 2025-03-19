@@ -1,149 +1,133 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
-import numpy as np
-from transformers import pipeline
-from sklearn.preprocessing import StandardScaler
-import joblib
+from typing import Optional, Dict, List
+import requests
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="MediAssist AI Backend")
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Update this with your frontend URL in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize ML models
-chatbot = pipeline("text2text-generation", model="google/flan-t5-small")
+# Get Hugging Face API token from environment variable
+HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
+if not HUGGINGFACE_API_TOKEN:
+    raise ValueError("HUGGINGFACE_API_TOKEN environment variable is not set")
 
-# Initialize scaler for health metrics
-scaler = StandardScaler()
-
+# Models for request/response
 class ChatMessage(BaseModel):
     message: str
 
-class HealthMetrics(BaseModel):
+class HealthData(BaseModel):
     bloodPressure: str
-    bloodSugar: str
-    cholesterol: str
-    heartRate: str
-    temperature: str
+    bloodSugar: float
+    cholesterol: float
+    heartRate: float
+    symptoms: str
 
-@app.post("/api/chat")
-async def chat(message: ChatMessage):
+class PredictionResponse(BaseModel):
+    prediction: str
+    recommendations: List[str]
+    risk_level: str
+
+# Medical chatbot endpoint
+@app.post("/chat")
+async def chat_endpoint(chat_input: ChatMessage):
     try:
-        # Generate response using the medical chatbot
-        prompt = f"Answer this medical question professionally and concisely: {message.message}"
-        response = chatbot(prompt, max_length=150, min_length=30)[0]['generated_text']
+        # Using Hugging Face's API for medical dialogue
+        API_URL = "https://api-inference.huggingface.co/models/microsoft/BioGPT"
+        headers = {"Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}"}
         
-        # Add a medical disclaimer
-        disclaimer = "\n\nNote: This is AI-generated advice. Please consult with a healthcare professional for accurate medical guidance."
-        return {"response": response + disclaimer}
+        # Prepare the prompt with medical context
+        prompt = f"Medical Assistant: You are asking about: {chat_input.message}\nResponse:"
+        
+        response = requests.post(
+            API_URL,
+            headers=headers,
+            json={"inputs": prompt, "parameters": {"max_length": 150}}
+        )
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Error communicating with AI model")
+            
+        result = response.json()
+        
+        # Extract and clean the response
+        ai_response = result[0]["generated_text"].replace(prompt, "").strip()
+        
+        return {"response": ai_response}
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/predict")
-async def predict(metrics: HealthMetrics):
+# Health prediction endpoint
+@app.post("/predict")
+async def predict_health(health_data: HealthData):
     try:
-        # Extract and process health metrics
-        try:
-            systolic, diastolic = map(int, metrics.bloodPressure.split('/'))
-            sugar = float(metrics.bloodSugar)
-            chol = float(metrics.cholesterol)
-            hr = float(metrics.heartRate)
-            temp = float(metrics.temperature)
+        # Parse blood pressure
+        systolic, diastolic = map(int, health_data.bloodPressure.split('/'))
+        
+        # Basic risk assessment logic
+        risk_factors = []
+        recommendations = []
+        
+        # Blood pressure analysis
+        if systolic >= 140 or diastolic >= 90:
+            risk_factors.append("high blood pressure")
+            recommendations.append("Consider consulting a healthcare provider about blood pressure management")
             
-            # Create feature vector
-            features = np.array([[systolic, diastolic, sugar, chol, hr, temp]])
+        # Blood sugar analysis
+        if health_data.bloodSugar > 140:
+            risk_factors.append("elevated blood sugar")
+            recommendations.append("Monitor blood sugar levels and maintain a balanced diet")
             
-            # Rule-based analysis with medical context
-            concerns = []
-            recommendations = []
-            risk_level = "low"
+        # Cholesterol analysis
+        if health_data.cholesterol > 200:
+            risk_factors.append("high cholesterol")
+            recommendations.append("Consider lifestyle changes and consult with a healthcare provider")
             
-            # Blood pressure analysis
-            if systolic >= 180 or diastolic >= 120:
-                concerns.append("hypertensive crisis")
-                recommendations.append("seek immediate medical attention")
-                risk_level = "high"
-            elif systolic >= 140 or diastolic >= 90:
-                concerns.append("high blood pressure")
-                recommendations.append("reduce sodium intake, exercise regularly, and monitor blood pressure")
-                risk_level = "moderate"
+        # Heart rate analysis
+        if health_data.heartRate > 100:
+            risk_factors.append("elevated heart rate")
+            recommendations.append("Monitor heart rate and consider stress reduction techniques")
             
-            # Blood sugar analysis
-            if sugar >= 200:
-                concerns.append("high blood sugar")
-                recommendations.append("monitor carbohydrate intake and consult an endocrinologist")
-                risk_level = max(risk_level, "moderate")
-            elif sugar >= 140:
-                concerns.append("elevated blood sugar")
-                recommendations.append("monitor diet and exercise regularly")
+        # Determine risk level
+        risk_level = "low"
+        if len(risk_factors) >= 3:
+            risk_level = "high"
+        elif len(risk_factors) >= 1:
+            risk_level = "moderate"
             
-            # Cholesterol analysis
-            if chol >= 240:
-                concerns.append("high cholesterol")
-                recommendations.append("adopt a heart-healthy diet and consult with your doctor")
-                risk_level = max(risk_level, "moderate")
-            elif chol >= 200:
-                concerns.append("borderline high cholesterol")
-                recommendations.append("increase physical activity and reduce saturated fats")
+        # Generate prediction summary
+        prediction = "Based on your health data, "
+        if risk_factors:
+            prediction += f"you show signs of {', '.join(risk_factors)}. "
+        else:
+            prediction += "your vital signs are within normal ranges. "
+            recommendations.append("Continue maintaining your healthy lifestyle")
             
-            # Heart rate analysis
-            if hr >= 120:
-                concerns.append("elevated heart rate")
-                recommendations.append("practice relaxation techniques and monitor stress levels")
-                risk_level = max(risk_level, "moderate")
-            
-            # Temperature analysis
-            if temp >= 103:
-                concerns.append("high fever")
-                recommendations.append("seek immediate medical attention")
-                risk_level = "high"
-            elif temp >= 100.4:
-                concerns.append("fever")
-                recommendations.append("rest, stay hydrated, and monitor temperature")
-                risk_level = max(risk_level, "moderate")
-            
-            # Generate comprehensive analysis
-            if concerns:
-                analysis = {
-                    "risk_level": risk_level,
-                    "concerns": concerns,
-                    "recommendations": recommendations,
-                    "summary": f"Based on your results, we identified {', '.join(concerns)}. " \
-                             f"Key recommendations: {'; '.join(recommendations)}. " \
-                             "Please consult with your healthcare provider for proper medical advice."
-                }
-            else:
-                analysis = {
-                    "risk_level": "low",
-                    "concerns": [],
-                    "recommendations": ["maintain current healthy lifestyle"],
-                    "summary": "Your health metrics appear to be within normal ranges. " \
-                             "Continue maintaining your healthy lifestyle!"
-                }
-            
-            return analysis
-            
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid input format. Please ensure all values are entered correctly."
-            )
-            
+        return PredictionResponse(
+            prediction=prediction,
+            recommendations=recommendations,
+            risk_level=risk_level
+        )
+        
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid blood pressure format. Use format: 120/80")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
